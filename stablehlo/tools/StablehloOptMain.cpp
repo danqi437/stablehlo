@@ -14,21 +14,37 @@ limitations under the License.
 ==============================================================================*/
 
 #include "llvm/Support/LogicalResult.h"
+#include "mlir/Tools/mlir-opt/MlirOptMain.h"
+#include "stablehlo/dialect/Register.h"
+#include "stablehlo/transforms/Passes.h"
+
+#ifdef STABLEHLO_OPT_MINIMAL
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Transforms/Passes.h"
+#else
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllExtensions.h"
 #include "mlir/InitAllPasses.h"
-#include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "stablehlo/conversions/linalg/transforms/Passes.h"
 #include "stablehlo/conversions/tosa/transforms/Passes.h"
-#include "stablehlo/dialect/Register.h"
 #include "stablehlo/reference/InterpreterOps.h"
 #include "stablehlo/reference/InterpreterPasses.h"
 #include "stablehlo/tests/CheckOps.h"
 #include "stablehlo/tests/TestUtils.h"
-#include "stablehlo/transforms/Passes.h"
 #include "stablehlo/transforms/optimization/Passes.h"
+#endif
 
 int main(int argc, char **argv) {
+#ifdef STABLEHLO_OPT_MINIMAL
+  mlir::registerInlinerPass();
+  mlir::registerCanonicalizerPass();
+  mlir::stablehlo::registerPasses();
+  mlir::stablehlo::registerPassPipelines();
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  registry.insert<mlir::func::FuncDialect>();
+#else
   mlir::registerAllPasses();
   mlir::hlo::registerAllTestPasses();
   mlir::stablehlo::registerPassPipelines();
@@ -44,6 +60,7 @@ int main(int argc, char **argv) {
   mlir::stablehlo::registerAllDialects(registry);
   registry.insert<mlir::stablehlo::check::CheckDialect>();
   registry.insert<mlir::stablehlo::interpreter::InterpreterDialect>();
+#endif
 
   return failed(
       mlir::MlirOptMain(argc, argv, "StableHLO optimizer driver\n", registry));

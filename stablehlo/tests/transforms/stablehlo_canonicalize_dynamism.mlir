@@ -562,3 +562,55 @@ func.func @real_dynamic_slice_to_slice_inapplicable_dynamic_strides(%arg0: tenso
   %2 = stablehlo.real_dynamic_slice %arg0, %0, %1, %arg1 : (tensor<4xf32>, tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<1xf32>
   return %2 : tensor<1xf32>
 }
+
+// -----
+
+func.func @dynamic_reduce_window_reducer(%arg0: tensor<i32>, %arg1: tensor<i32>) -> tensor<i32> {
+  %0 = stablehlo.add %arg0, %arg1 : tensor<i32>
+  return %0 : tensor<i32>
+}
+
+// CHECK-LABEL: func @dynamic_reduce_window_success
+// CHECK-NOT: stablehlo.custom_call
+// CHECK: "stablehlo.reduce_window"(%arg0, %arg1)
+// CHECK:   stablehlo.add
+// CHECK: window_dimensions = array<i64: 8>
+// CHECK-SAME: window_strides = array<i64: 1>
+// CHECK-SAME: base_dilations = array<i64: 1>
+// CHECK-SAME: window_dilations = array<i64: 1>
+// CHECK-SAME: padding = dense<{{\[}}[7, 0]]> : tensor<1x2xi64>
+// CHECK: (tensor<8xi32>, tensor<i32>) -> tensor<8xi32>
+func.func @dynamic_reduce_window_success(%arg0: tensor<8xi32>, %arg1: tensor<i32>) -> tensor<8xi32> {
+  %c_win = stablehlo.constant dense<8> : tensor<1xi32>
+  %c_stride = stablehlo.constant dense<1> : tensor<1xi32>
+  %c_base_dil = stablehlo.constant dense<1> : tensor<1xi32>
+  %c_win_dil = stablehlo.constant dense<1> : tensor<1xi32>
+  %c_pad = stablehlo.constant dense<[[7, 0]]> : tensor<1x2xi32>
+  %0 = stablehlo.custom_call @stablehlo.dynamic_reduce_window(%arg0, %arg1, %c_win, %c_stride, %c_base_dil, %c_win_dil, %c_pad) {
+    api_version = 2 : i32,
+    called_computations = [@dynamic_reduce_window_reducer]
+  } : (tensor<8xi32>, tensor<i32>, tensor<1xi32>, tensor<1xi32>, tensor<1xi32>, tensor<1xi32>, tensor<1x2xi32>) -> tensor<?xi32>
+  %1 = stablehlo.convert %0 : (tensor<?xi32>) -> tensor<8xi32>
+  return %1 : tensor<8xi32>
+}
+
+// -----
+
+func.func @dynamic_reduce_window_nonstatic_reducer(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+  %0 = stablehlo.add %arg0, %arg1 : tensor<f32>
+  return %0 : tensor<f32>
+}
+
+// CHECK-LABEL: func @dynamic_reduce_window_inapplicable_dynamic_params
+func.func @dynamic_reduce_window_inapplicable_dynamic_params(%arg0: tensor<10xf32>, %arg1: tensor<f32>, %arg2: tensor<1xi32>) -> tensor<?xf32> {
+  // CHECK: stablehlo.custom_call @stablehlo.dynamic_reduce_window
+  %c_stride = stablehlo.constant dense<1> : tensor<1xi32>
+  %c_base_dil = stablehlo.constant dense<1> : tensor<1xi32>
+  %c_win_dil = stablehlo.constant dense<1> : tensor<1xi32>
+  %c_pad = stablehlo.constant dense<[[0, 0]]> : tensor<1x2xi32>
+  %0 = stablehlo.custom_call @stablehlo.dynamic_reduce_window(%arg0, %arg1, %arg2, %c_stride, %c_base_dil, %c_win_dil, %c_pad) {
+    api_version = 2 : i32,
+    called_computations = [@dynamic_reduce_window_nonstatic_reducer]
+  } : (tensor<10xf32>, tensor<f32>, tensor<1xi32>, tensor<1xi32>, tensor<1xi32>, tensor<1xi32>, tensor<1x2xi32>) -> tensor<?xf32>
+  return %0 : tensor<?xf32>
+}

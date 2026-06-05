@@ -23,6 +23,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
@@ -99,6 +100,123 @@ struct CanonicalizeCustomCallOpPattern : public OpRewritePattern<CustomCallOp> {
     }
     rewriter.replaceOpWithNewOp<CustomCallOp>(op, op.getResultTypes(),
                                               newOperands, newAttrs);
+    return success();
+  }
+};
+
+struct CanonicalizeDynamicReduceWindowCustomCallPattern
+    : public OpRewritePattern<CustomCallOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(CustomCallOp op,
+                                PatternRewriter& rewriter) const override {
+    if (op.getCallTargetName() != "stablehlo.dynamic_reduce_window")
+      return rewriter.notifyMatchFailure(
+          op, "not a dynamic_reduce_window custom_call");
+
+    // Operand layout (from JAX's reduce_window lowering):
+    //   [inputs..., init_values..., window_dims, strides, base_dil, win_dil,
+    //   padding]
+    // num_inputs == num_init_values == num_results
+    unsigned numResults = op.getNumResults();
+    unsigned numOperands = op.getNumOperands();
+    if (numOperands != 2 * numResults + 5)
+      return rewriter.notifyMatchFailure(op, "unexpected operand count");
+
+    SmallVector<int64_t> windowDims, windowStrides, baseDilations,
+        windowDilations, paddingFlat;
+    if (!succeeded(
+            hlo::matchInts(op.getOperands()[2 * numResults], windowDims)) ||
+        !succeeded(hlo::matchInts(op.getOperands()[2 * numResults + 1],
+                                  windowStrides)) ||
+        !succeeded(hlo::matchInts(op.getOperands()[2 * numResults + 2],
+                                  baseDilations)) ||
+        !succeeded(hlo::matchInts(op.getOperands()[2 * numResults + 3],
+                                  windowDilations)) ||
+        !succeeded(hlo::matchInts(op.getOperands()[2 * numResults + 4],
+                                  paddingFlat)))
+      return rewriter.notifyMatchFailure(
+          op, "expected static window parameters");
+
+    // Look up the reducer function from called_computations.
+    auto calledComps = op.getCalledComputations();
+    if (calledComps.empty() || calledComps.size() != 1)
+      return rewriter.notifyMatchFailure(
+          op, "expected exactly one called_computation");
+    auto reducerSymRef = cast<FlatSymbolRefAttr>(calledComps[0]);
+    auto reducerFunc = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+        op, reducerSymRef);
+    if (!reducerFunc || reducerFunc.getBody().empty())
+      return rewriter.notifyMatchFailure(op, "reducer function not found");
+
+    // Materialize inputs/init_values into SmallVectors to own the values.
+    SmallVector<Value> inputs(op.getOperands().slice(0, numResults));
+    SmallVector<Value> initValues(
+        op.getOperands().slice(numResults, numResults));
+
+    int64_t rank = windowDims.size();
+    auto paddingAttr = DenseIntElementsAttr::get(
+        RankedTensorType::get({rank, 2}, rewriter.getI64Type()), paddingFlat);
+
+    // Compute static result types from input shapes and window parameters.
+    SmallVector<Type> resultTypes;
+    for (unsigned i = 0; i < numResults; ++i) {
+      auto inputType = cast<RankedTensorType>(inputs[i].getType());
+      SmallVector<int64_t> outputShape;
+      for (int64_t d = 0; d < rank; ++d) {
+        int64_t paddedSize = inputType.getDimSize(d);
+        // Apply base dilation: dilated_size = (size - 1) * base_dilation + 1
+        paddedSize = (paddedSize - 1) * baseDilations[d] + 1;
+        // Apply padding
+        paddedSize += paddingFlat[2 * d] + paddingFlat[2 * d + 1];
+        // Apply window dilation
+        int64_t dilatedWindow =
+            (windowDims[d] - 1) * windowDilations[d] + 1;
+        // Output dimension
+        int64_t outDim = (paddedSize - dilatedWindow) / windowStrides[d] + 1;
+        outputShape.push_back(outDim);
+      }
+      resultTypes.push_back(
+          RankedTensorType::get(outputShape, inputType.getElementType()));
+    }
+
+    // Create the ReduceWindowOp with explicit result types and empty body.
+    auto newOp = ReduceWindowOp::create(
+        rewriter, op.getLoc(), resultTypes, inputs, initValues,
+        rewriter.getDenseI64ArrayAttr(windowDims),
+        rewriter.getDenseI64ArrayAttr(windowStrides),
+        rewriter.getDenseI64ArrayAttr(baseDilations),
+        rewriter.getDenseI64ArrayAttr(windowDilations), paddingAttr);
+
+    // Populate the body region by cloning the reducer function.
+    Region& newBody = newOp.getBody();
+    Block& reducerBlock = reducerFunc.getBody().front();
+
+    SmallVector<Type> blockArgTypes;
+    SmallVector<Location> blockArgLocs;
+    for (auto arg : reducerBlock.getArguments()) {
+      blockArgTypes.push_back(arg.getType());
+      blockArgLocs.push_back(arg.getLoc());
+    }
+    Block* newBlock = rewriter.createBlock(&newBody, newBody.end(),
+                                           blockArgTypes, blockArgLocs);
+
+    IRMapping mapping;
+    for (auto [oldArg, newArg] :
+         llvm::zip(reducerBlock.getArguments(), newBlock->getArguments()))
+      mapping.map(oldArg, newArg);
+
+    rewriter.setInsertionPointToEnd(newBlock);
+    for (auto& reducerOp : reducerBlock.without_terminator())
+      rewriter.clone(reducerOp, mapping);
+
+    // Replace func.return with stablehlo.return.
+    auto funcReturn = cast<func::ReturnOp>(reducerBlock.getTerminator());
+    SmallVector<Value> returnOperands;
+    for (auto operand : funcReturn.getOperands())
+      returnOperands.push_back(mapping.lookupOrDefault(operand));
+    ReturnOp::create(rewriter, funcReturn.getLoc(), returnOperands);
+
+    rewriter.replaceOp(op, newOp.getResults());
     return success();
   }
 };
@@ -339,6 +457,7 @@ struct StablehloCanonicalizeDynamismPass
 void populateStablehloCanonicalizeDynamismPatterns(
     MLIRContext* context, RewritePatternSet* patterns) {
   patterns->add<CanonicalizeCustomCallOpPattern>(context);
+  patterns->add<CanonicalizeDynamicReduceWindowCustomCallPattern>(context);
   patterns->add<CanonicalizeDynamicBroadcastInDimOpPattern>(context);
   patterns->add<CanonicalizeDynamicConvOpPattern>(context);
   patterns->add<CanonicalizeDynamicGatherOpPattern>(context);
