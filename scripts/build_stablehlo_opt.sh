@@ -108,17 +108,21 @@ if [[ -f "$LLVM_VERSION_FILE" ]]; then
     cd "$LLVM_PROJECT_DIR"
     
     # Check if we need to checkout
-    CURRENT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "")
+    CURRENT_COMMIT=$(git -c safe.directory="$LLVM_PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo "")
     if [[ "$CURRENT_COMMIT" != "$REQUIRED_LLVM_COMMIT" ]]; then
       echo "Current:  $CURRENT_COMMIT"
       echo "Required: $REQUIRED_LLVM_COMMIT"
       echo ""
       echo "Fetching LLVM commit (this may take a while)..."
-      git fetch --progress origin "$REQUIRED_LLVM_COMMIT" || true
+      git -c safe.directory="$LLVM_PROJECT_DIR" fetch --progress origin "$REQUIRED_LLVM_COMMIT" || {
+        echo "Error: Failed to fetch LLVM commit $REQUIRED_LLVM_COMMIT"
+        exit 1
+      }
       echo ""
       echo "Checking out LLVM commit..."
-      git checkout --progress "$REQUIRED_LLVM_COMMIT" || {
-        echo "Warning: Could not checkout specific commit, using current version"
+      git -c safe.directory="$LLVM_PROJECT_DIR" checkout --progress "$REQUIRED_LLVM_COMMIT" || {
+        echo "Error: Failed to checkout LLVM commit $REQUIRED_LLVM_COMMIT"
+        exit 1
       }
     else
       echo "LLVM already at required commit"
@@ -200,7 +204,7 @@ else
   echo ">>> Step 2: Building LLVM/MLIR <<<"
   echo "----------------------------------------------"
 
-  cmake --build "$BUILD_DIR" -- -j$(nproc)
+  cmake --build "$BUILD_DIR" --target mlir-libraries mlir-pdll -- -j$(nproc)
 fi
 
 # ============================================
