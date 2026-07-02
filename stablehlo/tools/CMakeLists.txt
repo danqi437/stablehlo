@@ -24,7 +24,20 @@ set(LLVM_OPTIONAL_SOURCES
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
 get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
-set(LIBS
+
+if(STABLEHLO_OPT_MINIMAL)
+  set(LIBS
+        MLIROptLib
+        MLIRFuncDialect
+        MLIRIR
+        MLIRPass
+        MLIRSupport
+        MLIRTransforms
+        StablehloRegister
+        StablehloPasses
+        )
+else()
+  set(LIBS
         ${dialect_libs}
         ${conversion_libs}
         ${extension_libs}
@@ -41,8 +54,12 @@ set(LIBS
         StablehloLinalgTransforms
         StablehloTOSATransforms
         )
+endif()
 add_llvm_executable(stablehlo-opt StablehloOptMain.cpp)
 llvm_update_compile_flags(stablehlo-opt)
+if(STABLEHLO_OPT_MINIMAL)
+  target_compile_definitions(stablehlo-opt PRIVATE STABLEHLO_OPT_MINIMAL)
+endif()
 target_link_libraries(stablehlo-opt PRIVATE ${LIBS})
 
 mlir_check_all_link_libraries(stablehlo-opt)
